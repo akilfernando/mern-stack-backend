@@ -1,21 +1,21 @@
 import express from 'express';
 import cors from 'cors';
-import { v4 as uuidv4 } from 'uuid'; 
+import { v4 as uuidv4 } from 'uuid';
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
+import swaggerUi from 'swagger-ui-express'; // Import Swagger UI
+import YAML from 'yamljs'; // Import YAML parser
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middleware
 app.use(express.json());
 app.use(cors());
 
-// --- MongoDB Connection ---
 const MONGODB_URI = process.env.MONGODB_URI;
 
 mongoose.connect(MONGODB_URI)
@@ -29,13 +29,13 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true },
     phone: { type: String, required: true },
     password: { type: String, required: true },
+    role: { type: String, default: 'user', enum: ['user', 'admin'] },
   },
   {
     timestamps: true,
   }
 );
 
-// Pre-save hook to hash password before saving
 userSchema.pre('save', async function(next) {
   if (!this.isModified('password')) {
     next();
@@ -45,74 +45,86 @@ userSchema.pre('save', async function(next) {
   next();
 });
 
-// Method to compare passwords
 userSchema.methods.matchPassword = async function(enteredPassword) {
   return await bcrypt.compare(enteredPassword, this.password);
 };
 
 const User = mongoose.model('User', userSchema);
 
-let products = [
+// --- Product Schema and Model ---
+const productSchema = new mongoose.Schema(
   {
-    id: '1',
-    title: "Wireless Headphones",
-    description: "Noise cancelling over-ear headphones with deep bass.",
-    image: "https://res.cloudinary.com/da3w329cx/image/upload/v1683056487/samples/landscapes/nature-mountains.jpg",
-    price: 120,
+    title: { type: String, required: true },
+    image: { type: String, required: true },
+    description: { type: String, required: true },
+    price: { type: Number, required: true, min: 0 },
   },
   {
-    id: '2',
-    title: "Smart Watch",
-    description: "Smart wearable with health tracking, notifications, and long battery life.",
-    image: "https://res.cloudinary.com/da3w329cx/image/upload/v1683056500/cld-sample-5.jpg",
-    price: 80,
-  },
-  {
-    id: '3',
-    title: "Laptop",
-    description: "14-inch Full HD display, 256GB SSD, 8GB RAM. Perfect for productivity.",
-    image: "https://res.cloudinary.com/da3w329cx/image/upload/v1683056499/cld-sample-3.jpg",
-    price: 600,
-  },
-];
+    timestamps: true,
+  }
+);
+const Product = mongoose.model('Product', productSchema);
 
 // --- JWT Token Generation Helper ---
 const generateToken = (id) => {
   return jwt.sign({ id }, process.env.JWT_SECRET, {
-    expiresIn: '1h', // Token expires in 1 hour
+    expiresIn: '1h',
   });
 };
 
-// --- Auth Routes ---
+// --- Auth Middleware ---
+const protect = async (req, res, next) => {
+  let token;
+  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+    try {
+      token = req.headers.authorization.split(' ')[1];
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      req.user = await User.findById(decoded.id).select('-password');
+      next();
+    } catch (error) {
+      console.error(error);
+      res.status(401).json({ message: 'Not authorized, token failed' });
+    }
+  }
+  if (!token) {
+    res.status(401).json({ message: 'Not authorized, no token' });
+  }
+};
 
-// POST /api/auth/register - Register a new user
+// --- Role Authorization Middleware ---
+const authorizeRoles = (...roles) => {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      return res.status(403).json({ message: 'Not authorized to access this route' });
+    }
+    next();
+  };
+};
+
+// --- Swagger Docs Setup ---
+const swaggerDocument = YAML.load('./swagger.yaml');
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
+
+// --- Auth Routes ---
 app.post('/api/auth/register', async (req, res) => {
   const { fullName, email, phone, password } = req.body;
-
   if (!fullName || !email || !phone || !password) {
     return res.status(400).json({ message: 'Please enter all fields' });
   }
-
   try {
     const userExists = await User.findOne({ email });
     if (userExists) {
       return res.status(400).json({ message: 'User already exists' });
     }
-
-    const user = await User.create({
-      fullName,
-      email,
-      phone,
-      password, // Password will be hashed by the pre-save hook
-    });
-
+    const user = await User.create({ fullName, email, phone, password });
     if (user) {
       res.status(201).json({
         _id: user._id,
         fullName: user.fullName,
         email: user.email,
         phone: user.phone,
-        token: generateToken(user._id), // Return JWT
+        role: user.role,
+        token: generateToken(user._id),
       });
     } else {
       res.status(400).json({ message: 'Invalid user data' });
@@ -122,117 +134,119 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// POST /api/auth/login - Authenticate user & get token
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
-
   if (!email || !password) {
     return res.status(400).json({ message: 'Please enter all fields' });
   }
-
   try {
     const user = await User.findOne({ email });
-
     if (user && (await user.matchPassword(password))) {
       res.status(200).json({
         _id: user._id,
         fullName: user.fullName,
         email: user.email,
         phone: user.phone,
-        token: generateToken(user._id), // Return JWT
+        role: user.role,
+        token: generateToken(user._id),
       });
     } else {
-      res.status(401).json({ message: 'Invalid email or password' }); // 401 Unauthorized
+      res.status(401).json({ message: 'Invalid email or password' });
     }
   } catch (error) {
     res.status(500).json({ message: 'Server Error', error: error.message });
   }
 });
 
-// --- Product Routes (using in-memory array as per your current setup) ---
-
-// GET /api/products - Get all products
-app.get('/api/products', (req, res) => {
-  res.status(200).json(products);
-});
-
-// GET /api/products/:id - Get one product
-app.get('/api/products/:id', (req, res) => {
-  const { id } = req.params;
-  const product = products.find(p => p.id === id);
-
-  if (product) {
-    res.status(200).json(product);
-  } else {
-    res.status(404).json({ message: 'Product not found' });
+// --- Product Routes ---
+app.get('/api/products', async (req, res) => {
+  try {
+    const products = await Product.find({});
+    res.status(200).json(products);
+  } catch (error) {
+    res.status(500).json({ message: 'Server Error', error: error.message });
   }
 });
 
-// POST /api/products - Add a product
-app.post('/api/products', (req, res) => {
-  const { title, image, description, price } = req.body;
+app.get('/api/products/:id', async (req, res) => {
+  try {
+    const product = await Product.findById(req.params.id);
+    if (product) {
+      res.status(200).json(product);
+    } else {
+      res.status(404).json({ message: 'Product not found' });
+    }
+  } catch (error) {
+    if (error.name === 'CastError') {
+      return res.status(400).json({ message: 'Invalid product ID format' });
+    }
+    res.status(500).json({ message: 'Server Error', error: error.message });
+  }
+});
 
+app.post('/api/products', protect, authorizeRoles('admin'), async (req, res) => {
+  const { title, image, description, price } = req.body;
   if (!title || !image || !description || !price) {
     return res.status(400).json({ message: 'Please provide all required fields: title, image, description, price' });
   }
   if (typeof price !== 'number' || price <= 0) {
     return res.status(400).json({ message: 'Price must be a positive number' });
   }
-
-  const newProduct = {
-    id: uuidv4(),
-    title,
-    image,
-    description,
-    price,
-  };
-
-  products.push(newProduct);
-  res.status(201).json(newProduct);
+  try {
+    const newProduct = new Product({ title, image, description, price });
+    const createdProduct = await newProduct.save();
+    res.status(201).json(createdProduct);
+  } catch (error) {
+    res.status(500).json({ message: 'Server Error', error: error.message });
+  }
 });
 
-// PUT /api/products/:id - Update a product
-app.put('/api/products/:id', (req, res) => {
-  const { id } = req.params;
+app.put('/api/products/:id', protect, authorizeRoles('admin'), async (req, res) => {
   const { title, image, description, price } = req.body;
+  try {
+    const product = await Product.findById(req.params.id);
+    if (product) {
+      product.title = title !== undefined ? title : product.title;
+      product.image = image !== undefined ? image : product.image;
+      product.description = description !== undefined ? description : product.description;
+      product.price = price !== undefined ? price : product.price;
 
-  let productFound = false;
-  products = products.map(product => {
-    if (product.id === id) {
-      productFound = true;
-      if (!title || !image || !description || !price) {
-        return res.status(400).json({ message: 'Please provide all required fields: title, image, description, price for update' });
+      if (title === undefined || image === undefined || description === undefined || price === undefined) {
+         return res.status(400).json({ message: 'Please provide all fields to update: title, image, description, price' });
       }
       if (typeof price !== 'number' || price <= 0) {
-        return res.status(400).json({ message: 'Price must be a positive number' });
+         return res.status(400).json({ message: 'Price must be a positive number' });
       }
-      return { ...product, title, image, description, price };
+
+      const updatedProduct = await product.save();
+      res.status(200).json(updatedProduct);
+    } else {
+      res.status(404).json({ message: 'Product not found' });
     }
-    return product;
-  });
-
-  if (productFound) {
-    const updatedProduct = products.find(p => p.id === id);
-    res.status(200).json(updatedProduct);
-  } else {
-    res.status(404).json({ message: 'Product not found' });
+  } catch (error) {
+    if (error.name === 'CastError') {
+      return res.status(400).json({ message: 'Invalid product ID format' });
+    }
+    res.status(500).json({ message: 'Server Error', error: error.message });
   }
 });
 
-// DELETE /api/products/:id - Delete a product
-app.delete('/api/products/:id', (req, res) => {
-  const { id } = req.params;
-  const initialLength = products.length;
-  products = products.filter(p => p.id !== id);
-
-  if (products.length < initialLength) {
-    res.status(200).json({ message: 'Product deleted successfully' });
-  } else {
-    res.status(404).json({ message: 'Product not found' });
+app.delete('/api/products/:id', protect, authorizeRoles('admin'), async (req, res) => {
+  try {
+    const product = await Product.findByIdAndDelete(req.params.id);
+    if (product) {
+      res.status(200).json({ message: 'Product deleted successfully' });
+    } else {
+      res.status(404).json({ message: 'Product not found' });
+    }
+  } catch (error) {
+    if (error.name === 'CastError') {
+      return res.status(400).json({ message: 'Invalid product ID format' });
+    }
+    res.status(500).json({ message: 'Server Error', error: error.message });
   }
 });
 
-// Server Start
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
